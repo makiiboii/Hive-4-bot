@@ -23,8 +23,10 @@ process.on('uncaughtException', err => {
     console.error('Uncaught Exception:', err);
 });
 
-// Discord client
-const OWNER_ID = '451647372628459520'; // replace with your Discord user ID
+// Discord client 238275197772365826
+const OWNER_ID = '451647372628459520'; // maki
+const OWNER_ID = '238275197772365826'; // gab
+
 
 const client = new Client({
     intents: [
