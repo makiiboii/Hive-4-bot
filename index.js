@@ -39,9 +39,9 @@ client.once('clientReady', () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
-// Command: !joinhive3
+// Command: !joinhive4confirm
 client.on('messageCreate', async (message) => {
-    if (message.content === '!joinhive3') {
+    if (message.content === '!joinhive4confirm') {
         if (message.author.id !== OWNER_ID) {
             return message.reply('❌ Only the bot owner can use this command.');
         }
