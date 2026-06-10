@@ -3,7 +3,9 @@ const {
     joinVoiceChannel,
     createAudioPlayer,
     createAudioResource,
-    AudioPlayerStatus
+    AudioPlayerStatus,
+    VoiceConnectionStatus,
+    entersState
 } = require('@discordjs/voice');
 
 const express = require('express');
@@ -45,6 +47,15 @@ const OWNER_IDS = [
 ];
 
 // ======================
+// Voice channel state (persisted across reconnects)
+// ======================
+let activeChannelId = null;
+let activeGuildId = null;
+let activeConnection = null;
+let activePlayer = null;
+let isReconnecting = false;
+
+// ======================
 // Discord client
 // ======================
 const client = new Client({
@@ -57,10 +68,140 @@ const client = new Client({
 });
 
 // ======================
+// Silence playback loop
+// ======================
+const silencePath = path.join(__dirname, 'silence.mp3');
+
+function startPlayLoop(player) {
+    const playLoop = () => {
+        try {
+            const resource = createAudioResource(silencePath);
+            player.play(resource);
+        } catch (err) {
+            console.error('Error creating audio resource:', err);
+        }
+    };
+
+    // Only register the Idle listener once per player instance
+    player.removeAllListeners(AudioPlayerStatus.Idle);
+    player.on(AudioPlayerStatus.Idle, () => {
+        playLoop();
+    });
+
+    playLoop();
+}
+
+// ======================
+// Join voice channel and wire up connection
+// ======================
+function joinAndPlay(channelId, guildId, adapterCreator) {
+    const connection = joinVoiceChannel({
+        channelId,
+        guildId,
+        adapterCreator,
+        selfDeaf: false
+    });
+
+    activeConnection = connection;
+
+    // Handle unexpected disconnects on the voice connection itself.
+    // Give Discord 5 s to self-heal (Signalling/Connecting); if it
+    // cannot recover, destroy the stale connection so the shard-resume
+    // handler can rebuild it cleanly.
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        try {
+            await Promise.race([
+                entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+                entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
+            ]);
+            // Connection recovered on its own — nothing to do
+        } catch {
+            console.warn('⚠️  Voice connection could not self-recover — destroying stale connection.');
+            try { connection.destroy(); } catch (_) {}
+            activeConnection = null;
+        }
+    });
+
+    if (!activePlayer) {
+        activePlayer = createAudioPlayer();
+    }
+
+    connection.subscribe(activePlayer);
+    startPlayLoop(activePlayer);
+
+    return connection;
+}
+
+// ======================
+// Exponential-backoff reconnect to voice channel
+// ======================
+async function reconnectWithBackoff() {
+    if (isReconnecting) return;
+    isReconnecting = true;
+
+    const MAX_DELAY_MS = 60_000;
+    let attempt = 0;
+
+    while (true) {
+        const delayMs = Math.min(1_000 * Math.pow(2, attempt), MAX_DELAY_MS);
+        console.log(`🔄 Reconnect attempt ${attempt + 1} — waiting ${delayMs / 1000}s...`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+
+        try {
+            // Ensure the Discord client is fully ready before trying to fetch guilds
+            if (!client.isReady()) {
+                console.log('⏳ Discord client not ready yet, retrying...');
+                attempt++;
+                continue;
+            }
+
+            // Re-fetch the guild so the voiceAdapterCreator is fresh
+            const guild = await client.guilds.fetch(activeGuildId);
+
+            console.log(`🔊 Rejoining voice channel ${activeChannelId} in guild ${activeGuildId}...`);
+            joinAndPlay(activeChannelId, activeGuildId, guild.voiceAdapterCreator);
+
+            console.log('✅ Successfully rejoined voice channel after reconnect.');
+            isReconnecting = false;
+            return;
+        } catch (err) {
+            console.error(`❌ Reconnect attempt ${attempt + 1} failed:`, err);
+            attempt++;
+        }
+    }
+}
+
+// ======================
 // Bot ready
 // ======================
 client.once('clientReady', () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
+});
+
+// ======================
+// Shard disconnect — triggered when the Discord WebSocket drops
+// ======================
+client.on('shardDisconnect', (event, shardId) => {
+    console.warn(`⚠️  Shard ${shardId} disconnected (code ${event.code}). Waiting for reconnect before rejoining voice channel.`);
+});
+
+// ======================
+// Shard reconnecting — WebSocket is being re-established
+// ======================
+client.on('shardReconnecting', (shardId) => {
+    console.log(`🔁 Shard ${shardId} is reconnecting to Discord...`);
+});
+
+// ======================
+// Shard resume — WebSocket is back; safe to rejoin voice channel
+// ======================
+client.on('shardResume', (shardId) => {
+    console.log(`✅ Shard ${shardId} resumed.`);
+
+    if (activeChannelId && activeGuildId) {
+        console.log('🔊 Shard resumed — scheduling voice channel rejoin...');
+        reconnectWithBackoff();
+    }
 });
 
 // ======================
@@ -85,50 +226,27 @@ client.on('messageCreate', async (message) => {
             return message.reply('❌ Join a voice channel first!');
         }
 
+        // Validate silence.mp3 exists before attempting to join
+        if (!fs.existsSync(silencePath)) {
+            return message.reply(
+                '❌ silence.mp3 not found! Put silence.mp3 in the bot folder.'
+            );
+        }
+
         try {
 
-            // Join VC
-            const connection = joinVoiceChannel({
-                channelId: channel.id,
-                guildId: channel.guild.id,
-                adapterCreator: channel.guild.voiceAdapterCreator,
-                selfDeaf: false
-            });
+            // Persist voice channel state so reconnect logic can restore it
+            activeChannelId = channel.id;
+            activeGuildId = channel.guild.id;
 
-            // Create audio player
-            const player = createAudioPlayer();
+            // Reset player so a fresh one is created for this session
+            activePlayer = null;
 
-            // Path to silence.mp3
-            const silencePath = path.join(__dirname, 'silence.mp3');
+            joinAndPlay(activeChannelId, activeGuildId, channel.guild.voiceAdapterCreator);
 
-            // Check if file exists
-            if (!fs.existsSync(silencePath)) {
-                return message.reply(
-                    '❌ silence.mp3 not found! Put silence.mp3 in the bot folder.'
-                );
-            }
-
-            // Play silent audio forever
-            const playLoop = () => {
-                const resource = createAudioResource(silencePath);
-                player.play(resource);
-            };
-
-            // Start playing
-            playLoop();
-
-            // Subscribe player
-            connection.subscribe(player);
-
-            // Loop forever
-            player.on(AudioPlayerStatus.Idle, () => {
-                playLoop();
-            });
-
-            // Success message
             message.reply('✅ Bot joined VC and is staying AFK 24/7');
 
-            console.log(`Joined VC: ${channel.name}`);
+            console.log(`Joined VC: ${channel.name} (${channel.id})`);
 
         } catch (err) {
 
